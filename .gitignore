@@ -1,0 +1,13 @@
+# Generated data — regenerate with the scripts in data_generator/,
+# never commit the output itself (some of these files are 500MB+).
+output/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Stray local artifacts
+Claude outputs/
+.DS_Store

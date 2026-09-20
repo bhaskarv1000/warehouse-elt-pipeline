@@ -10,6 +10,8 @@ import json
 import random
 from datetime import datetime, timedelta
 
+from asset_registry import BOT_IDS, CONVEYOR_IDS, PALLETIZER_IDS
+
 # --- Config ---
 NUM_CASES = 40_000
 START_DATE = datetime(2026, 9, 1)
@@ -37,10 +39,6 @@ TRANSITION_GAPS_SECONDS = {
 INDUCT_STATIONS = [f"INDUCT-{i:02d}" for i in range(1, 6)]
 BUFFER_LOCATIONS = [f"BUFFER-{a}{n:02d}" for a in "ABCD" for n in range(1, 21)]
 STAGING_DOCKS = [f"STAGING-DOCK-{i}" for i in range(1, 13)]
-
-BOT_IDS = [f"BOT-{i:03d}" for i in range(1, 21)]
-CONVEYOR_IDS = [f"CNV-Z{z}-{n:02d}" for z in range(1, 4) for n in range(1, 6)]
-PALLETIZER_IDS = [f"PLZ-{i:02d}" for i in range(1, 4)]
 
 SKU_IDS = [f"SKU-{random.randint(10000, 99999)}" for _ in range(300)]
 
