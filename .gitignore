@@ -11,3 +11,6 @@ venv/
 # Stray local artifacts
 Claude outputs/
 .DS_Store
+
+# Local AWS config
+.env
