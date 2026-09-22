@@ -14,3 +14,6 @@ Claude outputs/
 
 # Local AWS config
 .env
+
+# Claude Code local project settings
+.claude/

@@ -5,13 +5,13 @@
       "Sid": "AllowListBucket",
       "Effect": "Allow",
       "Action": "s3:ListBucket",
-      "Resource": "arn:aws:s3:::REPLACE_WITH_BUCKET_NAME"
+      "Resource": "arn:aws:s3:::bhaskarv1000-warehouse-elt-raw"
     },
     {
       "Sid": "AllowRawPrefixReadWrite",
       "Effect": "Allow",
       "Action": ["s3:PutObject", "s3:GetObject"],
-      "Resource": "arn:aws:s3:::REPLACE_WITH_BUCKET_NAME/raw/*"
+      "Resource": "arn:aws:s3:::bhaskarv1000-warehouse-elt-raw/raw/*"
     }
   ]
 }
