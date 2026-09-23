@@ -17,3 +17,7 @@ Claude outputs/
 
 # Claude Code local project settings
 .claude/
+
+# Airflow runtime state (regenerated locally by docker compose, not shared)
+logs/
+config/
