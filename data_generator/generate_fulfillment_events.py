@@ -4,7 +4,13 @@ pipeline project.
 
 Grain: one row per case per state transition. A single case produces
 5 rows tracing its journey from induction to shipping.
+
+Generates ONE day at a time (--date), not a date range. The original
+version hardcoded a Sept 1-30 backfill; that's fine for a one-off
+historical load, but Phase 3's Airflow DAG needs to call this once per
+day going forward, so "which day" has to be a parameter, not a constant.
 """
+import argparse
 import csv
 import json
 import random
@@ -13,9 +19,10 @@ from datetime import datetime, timedelta
 from asset_registry import BOT_IDS, CONVEYOR_IDS, PALLETIZER_IDS
 
 # --- Config ---
-NUM_CASES = 40_000
-START_DATE = datetime(2026, 9, 1)
-END_DATE = datetime(2026, 9, 30)
+# 40,000 cases over the original 30-day backfill averaged ~1,333/day;
+# keep that same daily volume so a single day here looks consistent
+# with a day pulled out of the earlier backfill.
+DEFAULT_NUM_CASES = 1_333
 OUTPUT_DIR = "output"
 
 STATE_SEQUENCE = [
@@ -43,13 +50,27 @@ STAGING_DOCKS = [f"STAGING-DOCK-{i}" for i in range(1, 13)]
 SKU_IDS = [f"SKU-{random.randint(10000, 99999)}" for _ in range(300)]
 
 
-def random_start_time() -> datetime:
-    """Pick a random induction timestamp within the date range, weighted
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate one day of case_fulfillment_events data."
+    )
+    parser.add_argument(
+        "--date", required=True,
+        help="Target date to generate, format YYYY-MM-DD (this becomes the "
+             "case induction day, matching what an Airflow DAG's execution "
+             "date would pass in)",
+    )
+    parser.add_argument(
+        "--num-cases", type=int, default=DEFAULT_NUM_CASES,
+        help=f"Number of cases to generate for this day (default {DEFAULT_NUM_CASES})",
+    )
+    return parser.parse_args()
+
+
+def random_start_time(target_date: datetime) -> datetime:
+    """Pick a random induction timestamp within target_date, weighted
     toward daytime hours (06:00-22:00) since inbound volume is heavier
     during shifts than overnight, even on a system that runs 24/7."""
-    day_offset = random.randint(0, (END_DATE - START_DATE).days - 1)
-    day = START_DATE + timedelta(days=day_offset)
-
     if random.random() < 0.8:
         hour = random.randint(6, 21)
     else:
@@ -57,7 +78,7 @@ def random_start_time() -> datetime:
 
     minute = random.randint(0, 59)
     second = random.randint(0, 59)
-    return day.replace(hour=hour, minute=minute, second=second)
+    return target_date.replace(hour=hour, minute=minute, second=second)
 
 
 def next_timestamp(current_ts: datetime, from_state: str, to_state: str) -> datetime:
@@ -85,8 +106,15 @@ def generate_order_assignments(num_cases: int) -> list[tuple[str, str]]:
     return assignments[:num_cases]
 
 
-def build_case_events(case_index: int, order_id: str, order_line_id: str) -> list[dict]:
-    case_id = f"CASE-{case_index:08d}"
+def build_case_events(
+    case_index: int, order_id: str, order_line_id: str, target_date: datetime
+) -> list[dict]:
+    # Date baked into the ID, not just the timestamp: case_index resets to 0
+    # every run, so without the date prefix, day 2's CASE-00000000 would
+    # collide with day 1's — harmless for a single backfill, silently wrong
+    # once this runs once per day for real.
+    date_tag = target_date.strftime("%Y%m%d")
+    case_id = f"CASE-{date_tag}-{case_index:06d}"
     sku_id = random.choice(SKU_IDS)
 
     buffer_loc = random.choice(BUFFER_LOCATIONS)
@@ -96,7 +124,7 @@ def build_case_events(case_index: int, order_id: str, order_line_id: str) -> lis
     bot_id = random.choice(BOT_IDS)
     conveyor_id = random.choice(CONVEYOR_IDS)
 
-    ts = random_start_time()
+    ts = random_start_time(target_date)
     events = []
 
     for i, state in enumerate(STATE_SEQUENCE):
@@ -122,7 +150,7 @@ def build_case_events(case_index: int, order_id: str, order_line_id: str) -> lis
             source, target, asset = staging_dock, None, None
 
         events.append({
-            "event_id": f"evt_{case_index:08d}_{i}",
+            "event_id": f"evt_{date_tag}_{case_index:06d}_{i}",
             "event_timestamp": ts.isoformat(),
             "case_id": case_id,
             "order_id": order_id if has_order_context else None,
@@ -153,19 +181,24 @@ def write_csv(rows: list[dict], path: str) -> None:
 
 def main():
     import os
+
+    args = parse_args()
+    target_date = datetime.strptime(args.date, "%Y-%m-%d")
+    num_cases = args.num_cases
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    order_assignments = generate_order_assignments(NUM_CASES)
+    order_assignments = generate_order_assignments(num_cases)
 
     all_rows = []
-    for i in range(NUM_CASES):
+    for i in range(num_cases):
         order_id, order_line_id = order_assignments[i]
-        all_rows.extend(build_case_events(i, order_id, order_line_id))
+        all_rows.extend(build_case_events(i, order_id, order_line_id, target_date))
 
     write_json(all_rows, f"{OUTPUT_DIR}/case_fulfillment_events.json")
     write_csv(all_rows, f"{OUTPUT_DIR}/case_fulfillment_events.csv")
 
-    print(f"Generated {len(all_rows)} events across {NUM_CASES} cases")
+    print(f"Generated {len(all_rows)} events across {num_cases} cases for {args.date}")
     print(f"Wrote to {OUTPUT_DIR}/case_fulfillment_events.{{json,csv}}")
 
 
