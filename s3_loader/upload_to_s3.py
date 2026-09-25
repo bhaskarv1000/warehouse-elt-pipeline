@@ -1,109 +1,81 @@
 """
-Lands the generated raw event files in S3, split into daily partitions
-by event date, so the S3 layout matches exactly what the Phase 3 Airflow
-DAG will produce for every future day (generate one day -> upload one
-partition -> COPY INTO Snowflake). Running this against the Sept 1-30
-backfill now means the partitioning logic gets built once, not once for
-the backfill and again later for daily runs.
+Lands one run date's generated files in S3.
 
-Two things this script normalizes on the way in, worth knowing:
+Layout (defined once in data_generator/output_paths.py):
+    output/<stream>/dt=<run_date>/<stream>.jsonl
+      -> s3://<bucket>/raw/<stream>/dt=<run_date>/<stream>.jsonl
 
-1. Format: the generators write case_fulfillment_events as a pretty
-   JSON array, but equipment_telemetry and system_exceptions_rejects as
-   newline-delimited JSON (NDJSON). Every partition uploaded here is
-   NDJSON regardless of the source format -- that's what Snowflake's
-   COPY INTO expects most naturally, and it keeps the three streams
-   consistent in the landing zone even though they aren't consistent
-   on disk.
-2. Field names: case_fulfillment_events dates its rows with
-   "event_timestamp"; the other two streams use "timestamp". That
-   mismatch is real (see STREAMS below), not a bug -- it's the kind of
-   inconsistency a landing zone just captures as-is; reconciling field
-   names is transformation work that belongs in dbt staging models
-   (Phase 5), not here.
+Partitioned by RUN date, not event date. The earlier version of this
+script re-split rows by the date in each event's timestamp. That worked
+for a one-shot 30-day backfill, but breaks for daily runs: a case
+inducted on Oct 1 can ship on Oct 2, so the Oct 1 run would write rows
+into dt=2026-10-02, and the Oct 2 run would then overwrite that same
+object and silently drop them. With run-date partitions each run owns
+exactly one object per stream, and re-running a day is a clean
+overwrite (idempotent). Event time is still on every row; dbt handles it.
 
-Only NDJSON is uploaded -- the CSV outputs are a convenience for
-eyeballing data locally and were never meant to be a second copy of the
-same rows sitting in S3.
+No format conversion happens here any more either: every generator now
+writes NDJSON directly, so this script just copies files up. (The
+event_timestamp vs timestamp field-name mismatch between streams is
+still captured as-is; reconciling it is dbt staging work, Phase 5.)
+
+Two ways to call it:
+  - CLI, locally:  python s3_loader/upload_to_s3.py --date 2026-10-01
+    (credentials from the ~/.aws profile named in WAREHOUSE_ELT_AWS_PROFILE)
+  - From Airflow:  upload_day(run_date, s3_client, bucket), where the DAG
+    builds s3_client from an Airflow AWS Connection instead of a local
+    profile, so no credentials live in the code or the container image.
 """
-import json
+import argparse
 import os
-from collections import defaultdict
+import sys
+from pathlib import Path
 
-import boto3
-
-# --- Config ---
-BUCKET_NAME = os.environ.get("WAREHOUSE_ELT_BUCKET", "")
-AWS_PROFILE = os.environ.get("WAREHOUSE_ELT_AWS_PROFILE", "warehouse-elt")
-OUTPUT_DIR = "output"
-
-# One entry per event stream: where the generator left its file, whether
-# that file is one JSON array or NDJSON, and which field holds the date
-# each row gets partitioned on.
-STREAMS = {
-    "case_fulfillment_events": {
-        "source_file": f"{OUTPUT_DIR}/case_fulfillment_events.json",
-        "source_format": "json_array",
-        "date_field": "event_timestamp",
-    },
-    "equipment_telemetry": {
-        "source_file": f"{OUTPUT_DIR}/equipment_telemetry.jsonl",
-        "source_format": "jsonl",
-        "date_field": "timestamp",
-    },
-    "system_exceptions_rejects": {
-        "source_file": f"{OUTPUT_DIR}/system_exceptions_rejects.jsonl",
-        "source_format": "jsonl",
-        "date_field": "timestamp",
-    },
-}
+# Reuse the generators' path definitions so the layout lives in one place.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data_generator"))
+from output_paths import STREAMS, partition_path, s3_key  # noqa: E402
 
 
-def read_rows(path: str, source_format: str) -> list[dict]:
-    with open(path) as f:
-        if source_format == "json_array":
-            return json.load(f)
-        return [json.loads(line) for line in f if line.strip()]
+def upload_day(run_date: str, s3_client, bucket: str) -> list[str]:
+    """Upload all three streams' partitions for one run date. Fails loudly
+    if any file is missing — a half-uploaded day is worse than a failed task,
+    because Airflow will retry a failed task but won't notice a partial one."""
+    missing = [str(partition_path(s, run_date)) for s in STREAMS
+               if not partition_path(s, run_date).exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"Missing generated output for {run_date}: {missing}. "
+            f"Run the generators for this date first."
+        )
 
-
-def group_by_date(rows: list[dict], date_field: str) -> dict[str, list[dict]]:
-    by_date = defaultdict(list)
-    for row in rows:
-        event_date = row[date_field][:10]  # "2026-09-09T08:36:31" -> "2026-09-09"
-        by_date[event_date].append(row)
-    return by_date
-
-
-def upload_partition(s3, stream_name: str, event_date: str, rows: list[dict]) -> str:
-    body = "\n".join(json.dumps(row) for row in rows)
-    key = f"raw/{stream_name}/dt={event_date}/{stream_name}.jsonl"
-    s3.put_object(Bucket=BUCKET_NAME, Key=key, Body=body.encode("utf-8"))
-    return key
+    uploaded = []
+    for stream in STREAMS:
+        local = partition_path(stream, run_date)
+        key = s3_key(stream, run_date)
+        s3_client.upload_file(str(local), bucket, key)
+        size_kb = local.stat().st_size / 1024
+        print(f"  uploaded s3://{bucket}/{key} ({size_kb:,.0f} KB)")
+        uploaded.append(key)
+    return uploaded
 
 
 def main() -> None:
-    if not BUCKET_NAME:
+    parser = argparse.ArgumentParser(description="Upload one run date's output to S3.")
+    parser.add_argument("--date", required=True, help="Run date, YYYY-MM-DD")
+    args = parser.parse_args()
+
+    bucket = os.environ.get("WAREHOUSE_ELT_BUCKET", "")
+    if not bucket:
         raise SystemExit(
             "Set WAREHOUSE_ELT_BUCKET to your S3 bucket name before running, "
             "e.g. export WAREHOUSE_ELT_BUCKET=your-bucket-name"
         )
 
-    session = boto3.Session(profile_name=AWS_PROFILE)
-    s3 = session.client("s3")
+    import boto3  # imported here so upload_day() is usable without it at import time
+    profile = os.environ.get("WAREHOUSE_ELT_AWS_PROFILE", "warehouse-elt")
+    s3 = boto3.Session(profile_name=profile).client("s3")
 
-    for stream_name, cfg in STREAMS.items():
-        if not os.path.exists(cfg["source_file"]):
-            print(f"Skipping {stream_name}: {cfg['source_file']} not found (regenerate it first)")
-            continue
-
-        rows = read_rows(cfg["source_file"], cfg["source_format"])
-        by_date = group_by_date(rows, cfg["date_field"])
-
-        for event_date in sorted(by_date):
-            key = upload_partition(s3, stream_name, event_date, by_date[event_date])
-            print(f"  uploaded s3://{BUCKET_NAME}/{key} ({len(by_date[event_date])} rows)")
-
-        print(f"{stream_name}: {len(by_date)} daily partitions, {len(rows)} rows total\n")
+    upload_day(args.date, s3, bucket)
 
 
 if __name__ == "__main__":
