@@ -11,19 +11,18 @@ historical load, but Phase 3's Airflow DAG needs to call this once per
 day going forward, so "which day" has to be a parameter, not a constant.
 """
 import argparse
-import csv
-import json
 import random
 from datetime import datetime, timedelta
 
 from asset_registry import BOT_IDS, CONVEYOR_IDS, PALLETIZER_IDS
+from output_paths import partition_path, write_jsonl
 
 # --- Config ---
 # 40,000 cases over the original 30-day backfill averaged ~1,333/day;
 # keep that same daily volume so a single day here looks consistent
 # with a day pulled out of the earlier backfill.
 DEFAULT_NUM_CASES = 1_333
-OUTPUT_DIR = "output"
+STREAM = "case_fulfillment_events"
 
 STATE_SEQUENCE = [
     "CASE_INDUCTED",
@@ -87,15 +86,21 @@ def next_timestamp(current_ts: datetime, from_state: str, to_state: str) -> date
     return current_ts + timedelta(seconds=gap)
 
 
-def generate_order_assignments(num_cases: int) -> list[tuple[str, str]]:
+def generate_order_assignments(num_cases: int, target_date: datetime) -> list[tuple[str, str]]:
     """Build a pool of orders, each with 1-4 line items, and return a
     shuffled list of (order_id, order_line_id) pairs — one per case —
     so that multiple cases can legitimately belong to the same order,
-    instead of every case getting its own one-off order."""
+    instead of every case getting its own one-off order.
+
+    Date is baked into order_id for the same reason as case_id: the
+    counter restarts at 1 every run, so without it every day would
+    reuse ORD-000001, ORD-000002, ... and orders from different days
+    would silently merge when joined on order_id."""
+    date_tag = target_date.strftime("%Y%m%d")
     assignments = []
     order_counter = 1
     while len(assignments) < num_cases:
-        order_id = f"ORD-{order_counter:06d}"
+        order_id = f"ORD-{date_tag}-{order_counter:06d}"
         num_lines = random.randint(1, 4)
         for line_num in range(1, num_lines + 1):
             assignments.append((order_id, f"{order_id}-L{line_num}"))
@@ -165,41 +170,23 @@ def build_case_events(
     return events
 
 
-def write_json(rows: list[dict], path: str) -> None:
-    with open(path, "w") as f:
-        json.dump(rows, f, indent=2)
-
-
-def write_csv(rows: list[dict], path: str) -> None:
-    if not rows:
-        return
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-        writer.writeheader()
-        writer.writerows(rows)
-
-
 def main():
-    import os
-
     args = parse_args()
     target_date = datetime.strptime(args.date, "%Y-%m-%d")
     num_cases = args.num_cases
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    order_assignments = generate_order_assignments(num_cases)
+    order_assignments = generate_order_assignments(num_cases, target_date)
 
     all_rows = []
     for i in range(num_cases):
         order_id, order_line_id = order_assignments[i]
         all_rows.extend(build_case_events(i, order_id, order_line_id, target_date))
 
-    write_json(all_rows, f"{OUTPUT_DIR}/case_fulfillment_events.json")
-    write_csv(all_rows, f"{OUTPUT_DIR}/case_fulfillment_events.csv")
+    out_path = partition_path(STREAM, args.date)
+    write_jsonl(all_rows, out_path)
 
     print(f"Generated {len(all_rows)} events across {num_cases} cases for {args.date}")
-    print(f"Wrote to {OUTPUT_DIR}/case_fulfillment_events.{{json,csv}}")
+    print(f"Wrote to {out_path}")
 
 
 if __name__ == "__main__":

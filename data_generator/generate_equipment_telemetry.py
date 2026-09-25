@@ -18,9 +18,18 @@ No case_id or order_id here, by design — mirrors how real PLC/bot
 firmware only knows its own motion and health, not what business
 object it's touching. That link only exists via asset_id + time,
 resolved downstream (later phase), not baked into this table.
+
+Generates ONE day at a time (--date), same as the fulfillment generator,
+so the Airflow DAG can call it once per daily run.
+
+Known simplification: each run starts every asset fresh (IDLE, ambient
+temperature, random battery) at 00:00. Carrying end-of-day state over
+from the previous day would be more realistic, but it would make day D
+depend on day D-1 having run, which breaks the "any day can be re-run
+on its own" property the DAG relies on. So the midnight reset is a
+deliberate trade: independence over continuity.
 """
-import csv
-import json
+import argparse
 import random
 from datetime import datetime, timedelta
 
@@ -28,18 +37,19 @@ from asset_registry import (
     BOT_IDS, CONVEYOR_IDS, LIFT_IDS, PALLETIZER_IDS,
     conveyor_zone, lift_zone, bot_zone,
 )
+from output_paths import partition_path, write_jsonl
 
 # --- Config ---
-START_DATE = datetime(2026, 9, 1)
-END_DATE = datetime(2026, 9, 30)
+STREAM = "equipment_telemetry"
 HEARTBEAT_SECONDS = 20
-OUTPUT_DIR = "output"
 
-# Deliberate anomaly: LIFT-03 runs hot for one shift on day 8, elevating
-# its fault rate. This is a natural byproduct of the state-duration model
+# Deliberate anomaly: LIFT-03 runs hot for one shift on 2026-09-08,
+# elevating its fault rate. Pinned to an absolute date (not "day 8 of the
+# run") now that each run is a single day — it only fires when that date
+# is generated. This is a natural byproduct of the state-duration model
 # below, not bolted-on special logic — it just biases the same mechanics.
 ANOMALY_ASSET_ID = "LIFT-03"
-ANOMALY_START = START_DATE + timedelta(days=7, hours=14)   # day 8, shift 2 start
+ANOMALY_START = datetime(2026, 9, 8, 14, 0)   # shift 2 start
 ANOMALY_END = ANOMALY_START + timedelta(hours=8)
 
 STATES = ["RUNNING", "IDLE", "BLOCKED", "STARVED", "FAULTED"]
@@ -121,7 +131,18 @@ def step_temp(current_temp: float, target_temp: float) -> float:
     return round(current_temp, 1)
 
 
-def simulate_asset(asset: dict) -> list[dict]:
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate one day of equipment_telemetry data."
+    )
+    parser.add_argument(
+        "--date", required=True,
+        help="Target date to generate, format YYYY-MM-DD (the Airflow run date)",
+    )
+    return parser.parse_args()
+
+
+def simulate_asset(asset: dict, day_start: datetime) -> list[dict]:
     asset_id = asset["asset_id"]
     asset_type = asset["asset_type"]
     zone_id = asset["zone_id"]
@@ -131,13 +152,16 @@ def simulate_asset(asset: dict) -> list[dict]:
     current_temp = AMBIENT_TEMP_C
     battery_pct = round(random.uniform(40, 100), 1) if is_bot else None
 
-    ts = START_DATE
+    day_end = day_start + timedelta(days=1)
+    date_tag = day_start.strftime("%Y%m%d")
+
+    ts = day_start
     state_ends_at = ts + state_duration(current_state)
 
     rows = []
     telemetry_counter = 0
 
-    while ts < END_DATE:
+    while ts < day_end:
         in_anomaly = (
             asset_id == ANOMALY_ASSET_ID and ANOMALY_START <= ts <= ANOMALY_END
         )
@@ -177,7 +201,10 @@ def simulate_asset(asset: dict) -> list[dict]:
             battery_pct = round(battery_pct, 1)
 
         rows.append({
-            "telemetry_id": f"tel_{asset_id}_{telemetry_counter:07d}",
+            # Date in the ID for the same reason as case_id: the counter
+            # restarts at 0 every run, so without it every day would
+            # produce tel_LIFT-03_0000000 again.
+            "telemetry_id": f"tel_{asset_id}_{date_tag}_{telemetry_counter:04d}",
             "timestamp": ts.isoformat(),
             "asset_id": asset_id,
             "asset_type": asset_type,
@@ -196,39 +223,20 @@ def simulate_asset(asset: dict) -> list[dict]:
     return rows
 
 
-def write_jsonl(rows: list[dict], path: str) -> None:
-    # Newline-delimited JSON, not a single indented array: at millions of
-    # rows, pretty-printing a JSON array bloats the file ~3-4x for no
-    # reason and can't be streamed. JSONL is also closer to what you'd
-    # actually land in S3 for a high-volume stream like this.
-    with open(path, "w") as f:
-        for row in rows:
-            f.write(json.dumps(row) + "\n")
-
-
-def write_csv(rows: list[dict], path: str) -> None:
-    if not rows:
-        return
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-        writer.writeheader()
-        writer.writerows(rows)
-
-
 def main():
-    import os
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    args = parse_args()
+    day_start = datetime.strptime(args.date, "%Y-%m-%d")
 
     roster = build_roster()
     all_rows = []
     for asset in roster:
-        all_rows.extend(simulate_asset(asset))
+        all_rows.extend(simulate_asset(asset, day_start))
 
-    write_jsonl(all_rows, f"{OUTPUT_DIR}/equipment_telemetry.jsonl")
-    write_csv(all_rows, f"{OUTPUT_DIR}/equipment_telemetry.csv")
+    out_path = partition_path(STREAM, args.date)
+    write_jsonl(all_rows, out_path)
 
-    print(f"Generated {len(all_rows)} telemetry rows across {len(roster)} assets")
-    print(f"Wrote to {OUTPUT_DIR}/equipment_telemetry.{{json,csv}}")
+    print(f"Generated {len(all_rows)} telemetry rows across {len(roster)} assets for {args.date}")
+    print(f"Wrote to {out_path}")
 
 
 if __name__ == "__main__":

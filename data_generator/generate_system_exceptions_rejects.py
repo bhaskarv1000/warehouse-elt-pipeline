@@ -11,25 +11,30 @@ actually exist elsewhere in the dataset, instead of inventing IDs that
 would never join to anything. That's also a preview of what an Airflow
 DAG will encode later as a task dependency: generate cases, then
 generate rejects.
+
+Generates ONE day at a time (--date). It reads the fulfillment output
+for that SAME date, so it must run after the fulfillment generator for
+that day — in the DAG that's an explicit task dependency:
+generate_fulfillment >> generate_exceptions.
 """
-import csv
+import argparse
 import json
 import random
 from datetime import datetime, timedelta
 
 from asset_registry import CONVEYOR_IDS, BOT_IDS, SCANNER_IDS, conveyor_zone, bot_zone, scanner_zone
+from output_paths import partition_path, write_jsonl
 
-START_DATE = datetime(2026, 9, 1)
-END_DATE = datetime(2026, 9, 30)
-OUTPUT_DIR = "output"
-FULFILLMENT_CSV = f"{OUTPUT_DIR}/case_fulfillment_events.csv"
+STREAM = "system_exceptions_rejects"
+FULFILLMENT_STREAM = "case_fulfillment_events"
 
 TARGET_REJECT_RATE = 0.02  # ~2% of cases produce a reject incident somewhere
 
 # Same anomaly window as equipment_telemetry's LIFT-03 event — knock-on
 # jams near the overheating lift, so the story is consistent across
 # streams instead of each table inventing its own unrelated incident.
-ANOMALY_START = START_DATE + timedelta(days=7, hours=14)
+# Absolute date: only injected when --date is 2026-09-08.
+ANOMALY_START = datetime(2026, 9, 8, 14, 0)
 ANOMALY_END = ANOMALY_START + timedelta(hours=8)
 ANOMALY_EXTRA_JAMS = 20
 
@@ -58,15 +63,30 @@ ACTION_BY_SEVERITY = {
 }
 
 
-def load_case_ids(path: str) -> list[str]:
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate one day of system_exceptions_rejects data."
+    )
+    parser.add_argument(
+        "--date", required=True,
+        help="Target date to generate, format YYYY-MM-DD (the Airflow run date). "
+             "The fulfillment output for this same date must already exist.",
+    )
+    return parser.parse_args()
+
+
+def load_case_ids(run_date: str) -> list[str]:
+    path = partition_path(FULFILLMENT_STREAM, run_date)
+    if not path.exists():
+        raise SystemExit(
+            f"No fulfillment output for {run_date} at {path} — "
+            f"run generate_fulfillment_events.py --date {run_date} first."
+        )
     with open(path) as f:
-        reader = csv.DictReader(f)
-        return sorted({row["case_id"] for row in reader})
+        return sorted({json.loads(line)["case_id"] for line in f if line.strip()})
 
 
-def random_timestamp() -> datetime:
-    day_offset = random.randint(0, (END_DATE - START_DATE).days - 1)
-    day = START_DATE + timedelta(days=day_offset)
+def random_timestamp(day: datetime) -> datetime:
     hour = random.randint(6, 21) if random.random() < 0.8 else random.choice([0, 1, 2, 3, 4, 5, 22, 23])
     return day.replace(hour=hour, minute=random.randint(0, 59), second=random.randint(0, 59))
 
@@ -76,7 +96,9 @@ def pick_weighted(options: list[tuple[str, int]]) -> str:
     return random.choices(values, weights=weights, k=1)[0]
 
 
-def build_reject(category: str, case_ids: list[str], forced_asset: str | None = None) -> dict:
+def build_reject(
+    category: str, case_ids: list[str], day: datetime, forced_asset: str | None = None
+) -> dict:
     severity = pick_weighted(SEVERITY_WEIGHTS)
 
     if category == "CONVEYOR_JAM":
@@ -94,8 +116,8 @@ def build_reject(category: str, case_ids: list[str], forced_asset: str | None = 
     case_id = None if category == "VISION_NO_READ" else random.choice(case_ids)
 
     return {
-        "exception_id": f"exc_{random.randint(10_000_000, 99_999_999)}",
-        "timestamp": random_timestamp().isoformat(),
+        "exception_id": None,  # assigned in main() once rows are sorted
+        "timestamp": random_timestamp(day).isoformat(),
         "asset_id": asset_id,
         "zone_id": zone_id,
         "case_id": case_id,
@@ -106,8 +128,8 @@ def build_reject(category: str, case_ids: list[str], forced_asset: str | None = 
     }
 
 
-def build_anomaly_jam(case_ids: list[str]) -> dict:
-    row = build_reject("CONVEYOR_JAM", case_ids=case_ids, forced_asset=random.choice(
+def build_anomaly_jam(case_ids: list[str], day: datetime) -> dict:
+    row = build_reject("CONVEYOR_JAM", case_ids=case_ids, day=day, forced_asset=random.choice(
         [c for c in CONVEYOR_IDS if conveyor_zone(c) == "Z3"]
     ))
     anomaly_span = (ANOMALY_END - ANOMALY_START).total_seconds()
@@ -117,42 +139,38 @@ def build_anomaly_jam(case_ids: list[str]) -> dict:
     return row
 
 
-def write_jsonl(rows: list[dict], path: str) -> None:
-    with open(path, "w") as f:
-        for row in rows:
-            f.write(json.dumps(row) + "\n")
-
-
-def write_csv(rows: list[dict], path: str) -> None:
-    if not rows:
-        return
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-        writer.writeheader()
-        writer.writerows(rows)
-
-
 def main():
-    import os
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    args = parse_args()
+    day = datetime.strptime(args.date, "%Y-%m-%d")
 
-    case_ids = load_case_ids(FULFILLMENT_CSV)
+    case_ids = load_case_ids(args.date)
     num_rejects = round(len(case_ids) * TARGET_REJECT_RATE)
 
     rows = []
     for _ in range(num_rejects):
         category = pick_weighted(REJECT_CATEGORIES)
-        rows.append(build_reject(category, case_ids))
+        rows.append(build_reject(category, case_ids, day))
 
-    for _ in range(ANOMALY_EXTRA_JAMS):
-        rows.append(build_anomaly_jam(case_ids))
+    is_anomaly_day = day.date() == ANOMALY_START.date()
+    if is_anomaly_day:
+        for _ in range(ANOMALY_EXTRA_JAMS):
+            rows.append(build_anomaly_jam(case_ids, day))
 
     rows.sort(key=lambda r: r["timestamp"])
 
-    write_jsonl(rows, f"{OUTPUT_DIR}/system_exceptions_rejects.jsonl")
-    write_csv(rows, f"{OUTPUT_DIR}/system_exceptions_rejects.csv")
+    # Sequential, date-stamped IDs instead of random 8-digit numbers: a
+    # random ID can collide (within a day or across days), and a
+    # sequential one is also deterministic on re-runs of the same day.
+    date_tag = day.strftime("%Y%m%d")
+    for i, row in enumerate(rows):
+        row["exception_id"] = f"exc_{date_tag}_{i:04d}"
 
-    print(f"Generated {len(rows)} reject incidents ({ANOMALY_EXTRA_JAMS} from the anomaly window)")
+    out_path = partition_path(STREAM, args.date)
+    write_jsonl(rows, out_path)
+
+    extra = f" ({ANOMALY_EXTRA_JAMS} from the LIFT-03 anomaly window)" if is_anomaly_day else ""
+    print(f"Generated {len(rows)} reject incidents for {args.date}{extra}")
+    print(f"Wrote to {out_path}")
 
 
 if __name__ == "__main__":
