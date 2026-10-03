@@ -1,9 +1,9 @@
 """
 Daily warehouse ELT pipeline: generate one day of synthetic warehouse
-data, then land it in S3.
+data, land it in S3, then load it into Snowflake.
 
     generate_fulfillment ──> generate_exceptions ──┐
-                                                   ├──> upload_to_s3
+                                                   ├──> upload_to_s3 ──> load_to_snowflake ──> check_raw_counts
     generate_telemetry ────────────────────────────┘
 
 - generate_exceptions waits for generate_fulfillment because it reads
@@ -12,8 +12,10 @@ data, then land it in S3.
   in parallel with them.
 - upload_to_s3 waits for all three, so a day is only uploaded once it's
   complete, never half-generated.
-
-Next step (not yet here): COPY INTO Snowflake after upload_to_s3.
+- load_to_snowflake runs dags/sql/load_raw_day.sql: delete that day's
+  RAW rows, then COPY INTO from S3, in one transaction (re-run safe).
+- check_raw_counts runs dags/sql/check_raw_day.sql and fails the run if
+  the load silently brought in nothing (COPY doesn't error on 0 files).
 
 Which day does a run process?
     {{ ds }} is the run's logical date. With CronDataIntervalTimetable,
@@ -28,6 +30,10 @@ import os
 
 import pendulum
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+from airflow.providers.common.sql.operators.sql import (
+    SQLCheckOperator,
+    SQLExecuteQueryOperator,
+)
 from airflow.providers.standard.operators.bash import BashOperator
 from airflow.sdk import dag, task
 from airflow.timetables.interval import CronDataIntervalTimetable
@@ -41,6 +47,10 @@ S3_LOADER_DIR = f"{AIRFLOW_HOME}/s3_loader"
 # Credentials live (encrypted by the Fernet key) in Airflow's metadata DB,
 # not in this file and not in the container image.
 AWS_CONN_ID = "aws_warehouse_elt"
+
+# Airflow Connection for the AIRFLOW_LOADER Snowflake service user
+# (key-pair sign-in, no password). Same idea: secret lives in Airflow.
+SNOWFLAKE_CONN_ID = "snowflake_warehouse_elt"
 
 default_args = {
     "owner": "bhaskar",
@@ -94,8 +104,26 @@ def warehouse_elt_daily():
         s3_client = S3Hook(aws_conn_id=AWS_CONN_ID).get_conn()
         return upload_day(ds, s3_client, bucket)
 
+    # SQL lives in dags/sql/ as Jinja templates; Airflow fills in {{ ds }}
+    # before sending it to Snowflake.
+    load_to_snowflake = SQLExecuteQueryOperator(
+        task_id="load_to_snowflake",
+        conn_id=SNOWFLAKE_CONN_ID,
+        sql="sql/load_raw_day.sql",
+        split_statements=True,   # the file holds several statements
+        do_xcom_push=False,      # don't store COPY's result tables in Airflow
+    )
+
+    check_raw_counts = SQLCheckOperator(
+        task_id="check_raw_counts",
+        conn_id=SNOWFLAKE_CONN_ID,
+        sql="sql/check_raw_day.sql",
+    )
+
     generate_fulfillment >> generate_exceptions
-    [generate_exceptions, generate_telemetry] >> upload_to_s3()
+    uploaded = upload_to_s3()
+    [generate_exceptions, generate_telemetry] >> uploaded
+    uploaded >> load_to_snowflake >> check_raw_counts
 
 
 warehouse_elt_daily()
