@@ -1,0 +1,10 @@
+version: 2
+
+sources:
+  - name: warehouse_raw
+    database: TELEMETRY_DB
+    schema: RAW
+    tables:
+      - name: case_fulfillment_events
+      - name: equipment_telemetry
+      - name: system_exceptions_rejects
