@@ -1,0 +1,50 @@
+version: 2
+
+models:
+  - name: stg_warehouse__case_fulfillment_events
+    description: One row per case per state transition, typed from the RAW JSON.
+    columns:
+      - name: event_id
+        description: Unique id of the state-transition event.
+        tests:
+          - unique
+          - not_null
+      - name: case_id
+        tests:
+          - not_null
+      - name: event_timestamp
+        tests:
+          - not_null
+      - name: order_id
+        description: Assigned at retrieval, so null for CASE_INDUCTED and STORED_IN_BUFFER.
+        tests:
+          - not_null:
+              config:
+                where: "event_type not in ('CASE_INDUCTED', 'STORED_IN_BUFFER')"
+
+  - name: stg_warehouse__equipment_telemetry
+    description: One row per asset per 20-second heartbeat.
+    columns:
+      - name: telemetry_id
+        tests:
+          - unique
+          - not_null
+      - name: asset_id
+        tests:
+          - not_null
+      - name: reading_timestamp
+        tests:
+          - not_null
+
+  - name: stg_warehouse__system_exceptions_rejects
+    description: One row per fault or reject incident.
+    columns:
+      - name: exception_id
+        tests:
+          - unique
+          - not_null
+      - name: exception_timestamp
+        tests:
+          - not_null
+      - name: case_id
+        description: Null by design for the VISION_NO_READ category, so no not_null test.
