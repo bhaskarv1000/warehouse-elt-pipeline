@@ -12,6 +12,10 @@ models:
       - name: case_id
         tests:
           - not_null
+      - name: event_type
+        tests:
+          - accepted_values:
+              values: ['CASE_INDUCTED', 'STORED_IN_BUFFER', 'RETRIEVED_FROM_BUFFER', 'PALLET_BUILT', 'SHIPPED']
       - name: event_timestamp
         tests:
           - not_null
@@ -32,6 +36,10 @@ models:
       - name: asset_id
         tests:
           - not_null
+      - name: operational_state
+        tests:
+          - accepted_values:
+              values: ['RUNNING', 'IDLE', 'CHARGING', 'FAULTED', 'STARVED', 'BLOCKED']
       - name: reading_timestamp
         tests:
           - not_null
@@ -46,5 +54,17 @@ models:
       - name: exception_timestamp
         tests:
           - not_null
+      - name: reject_category
+        tests:
+          - accepted_values:
+              values: ['VISION_NO_READ', 'DIMENSION_OVERHANG', 'CONVEYOR_JAM', 'ROBOTIC_MISPICK', 'WEIGHT_MISMATCH']
+      - name: reject_code
+        tests:
+          - accepted_values:
+              values: ['ERR_CAM_318', 'ERR_CAM_302', 'ERR_LABEL_UNREADABLE', 'ERR_DIM_OVER_TOLERANCE', 'ERR_DIM_UNDER_TOLERANCE', 'ERR_BOT_GRIP_FAIL', 'ERR_CNV_JAM', 'ERR_CNV_STALL', 'ERR_BOT_DROP', 'ERR_WEIGHT_LOW', 'ERR_WEIGHT_HIGH']
+      - name: severity
+        tests:
+          - accepted_values:
+              values: ['WARNING', 'ERROR', 'ESTOP_STOP']
       - name: case_id
         description: Null by design for the VISION_NO_READ category, so no not_null test.
