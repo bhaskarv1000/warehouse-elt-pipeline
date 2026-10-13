@@ -1,0 +1,13 @@
+version: 2
+
+models:
+  - name: int_warehouse__case_lifecycle
+    description: One row per case, with a timestamp for each fulfillment stage it reached.
+    columns:
+      - name: case_id
+        tests:
+          - unique
+          - not_null
+      - name: inducted_at
+        tests:
+          - not_null

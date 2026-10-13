@@ -33,3 +33,5 @@ models:
   warehouse_elt:
     staging:
       +materialized: view
+    intermediate:
+      +materialized: view
