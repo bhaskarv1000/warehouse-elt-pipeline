@@ -11,3 +11,19 @@ models:
       - name: inducted_at
         tests:
           - not_null
+
+  - name: int_warehouse__exceptions_enriched
+    description: One row per exception, with case context where the exception has a case_id.
+    columns:
+      - name: exception_id
+        tests:
+          - unique
+          - not_null
+      - name: case_id
+        description: Null for VISION_NO_READ rejects, which happen before a case is identified.
+        tests:
+          - relationships:
+              to: ref('int_warehouse__case_lifecycle')
+              field: case_id
+              config:
+                where: "case_id is not null"
