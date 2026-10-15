@@ -28,18 +28,7 @@ select
     c.shipped_at,
     c.is_shipped,
 
-    e.case_id is not null                                                   as has_case,
-
-    -- furthest stage the case had reached when the exception happened
-    case
-        when e.case_id is null                           then null
-        when c.shipped_at      <= e.exception_timestamp then 'SHIPPED'
-        when c.pallet_built_at <= e.exception_timestamp then 'PALLET_BUILT'
-        when c.retrieved_at    <= e.exception_timestamp then 'RETRIEVED_FROM_BUFFER'
-        when c.stored_at       <= e.exception_timestamp then 'STORED_IN_BUFFER'
-        when c.inducted_at     <= e.exception_timestamp then 'CASE_INDUCTED'
-        else 'BEFORE_INDUCTION'
-    end                                                                     as stage_at_exception
+    e.case_id is not null                                                   as has_case
 from exceptions e
 left join cases c
     on e.case_id = c.case_id
